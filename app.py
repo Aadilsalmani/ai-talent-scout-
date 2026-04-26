@@ -3,70 +3,61 @@ import re
 
 import pandas as pd
 import streamlit as st
-
 from dotenv import load_dotenv
+
 load_dotenv()
 
-# ── Optional AI import ────────────────────────────────────────────────────────
+# ── Groq SDK ──────────────────────────────────────────────────────────────────
+# Install: python -m pip install groq
 try:
-    import google.generativeai as genai
+    from groq import Groq
+    GROQ_AVAILABLE = True
 except ImportError:
-    genai = None
+    GROQ_AVAILABLE = False
 
 # ── Mode selector ─────────────────────────────────────────────────────────────
 mode = st.sidebar.selectbox("Select Mode", ["Recruiter View", "Candidate View"])
 
-# ── AI model setup ────────────────────────────────────────────────────────────
-api_key = os.getenv("GOOGLE_API_KEY", "").strip()
+# ── API key ───────────────────────────────────────────────────────────────────
+api_key = os.getenv("GROQ_API_KEY", "").strip()
 
 if not api_key:
     st.sidebar.markdown("---")
-    st.sidebar.markdown("### 🔑 API Key")
+    st.sidebar.markdown("### 🔑 Groq API Key")
     api_key = st.sidebar.text_input(
-        "Enter Google API Key",
+        "Enter Groq API Key",
         type="password",
-        help="Get one free at aistudio.google.com",
+        help="Free key at console.groq.com — no credit card needed",
     ).strip()
 
-CANDIDATE_MODELS = [
-    "gemini-1.5-pro-latest",
-    "gemini-pro"
-]
-
-model       = None
-model_name  = None
+# ── AI client setup ───────────────────────────────────────────────────────────
+client      = None
+model_name  = "llama-3.3-70b-versatile"
 model_error = None
 
-if not genai:
-    model_error = "google-generativeai not installed."
-elif api_key:
+if not GROQ_AVAILABLE:
+    model_error = "groq not installed. Run: python -m pip install groq"
+elif not api_key:
+    model_error = "No API key provided."
+else:
     try:
-        genai.configure(api_key=api_key)
-        # Try to find the first available working model
-        for name in CANDIDATE_MODELS:
-            try:
-                candidate = genai.GenerativeModel(name)
-                # A simple prompt to verify the key and model work
-                candidate.generate_content("Hi") 
-                model = candidate
-                model_name = name
-                break
-            except Exception as e:
-                last_error = str(e)
-        
-        if model is None:
-            model_error = f"API Key valid, but models failed. Error: {last_error}"
+        c = Groq(api_key=api_key)
+        # Lightweight probe to validate key
+        c.chat.completions.create(
+            model=model_name,
+            messages=[{"role": "user", "content": "ping"}],
+            max_tokens=1,
+        )
+        client = c
     except Exception as e:
-        model_error = f"Configuration error: {str(e)}"
+        model_error = str(e)
 
-
-
-strict_ai = st.sidebar.checkbox("🚫 Disable fallback (Strict AI Mode)")
-show_debug = st.sidebar.checkbox("🧠 Show AI Raw Output", key="show_ai_debug")
-
+# ── Sidebar options ───────────────────────────────────────────────────────────
+strict_ai  = st.sidebar.checkbox("🚫 Strict AI Mode (no fallback)")
+show_debug = st.sidebar.checkbox("🧠 Show AI Raw Output")
 
 st.sidebar.markdown("---")
-if model:
+if client:
     st.sidebar.success(f"✅ AI active · {model_name}")
 elif model_error:
     st.sidebar.error(f"❌ AI error:\n{model_error}")
@@ -84,66 +75,40 @@ else:
 
 # ── Candidate View ────────────────────────────────────────────────────────────
 if mode == "Candidate View":
-
-    # ✅ FIRST: success message
     if st.session_state.get("saved"):
         st.success("✅ Profile saved successfully!")
         st.balloons()
         st.session_state["saved"] = False
 
-    # ✅ SECOND: clear form BEFORE widgets are created
     if st.session_state.get("clear_form"):
-        st.session_state["name_input"] = ""
-        st.session_state["email_input"] = ""
-        st.session_state["skills_input"] = ""
-        st.session_state["response_input"] = ""
+        for k in ["name_input", "email_input", "skills_input", "response_input"]:
+            st.session_state[k] = ""
         st.session_state["clear_form"] = False
 
     st.title("👤 Candidate Portal")
 
-    # ✅ THEN create form
     with st.form("candidate_form"):
-
-        name = st.text_input("Enter Name", key="name_input")
-        email = st.text_input("Enter Email", key="email_input")
-        skills = st.text_input("Enter Skills (comma separated)", key="skills_input")
-        response = st.text_area("Why are you interested?", key="response_input")
-
+        name     = st.text_input("Enter Name",                     key="name_input")
+        email    = st.text_input("Enter Email",                    key="email_input")
+        skills   = st.text_input("Enter Skills (comma separated)", key="skills_input")
+        response = st.text_area("Why are you interested?",         key="response_input")
         submitted = st.form_submit_button("Save Profile")
 
         if submitted:
             if name and skills and email:
-                new_row = {
-                    "name": name,
-                    "email": email,
-                    "skills": skills,
-                    "response": response
-                }
-
-                df_new = pd.DataFrame([new_row])
-                df = pd.concat([df, df_new], ignore_index=True)
+                new_row = {"name": name, "email": email,
+                           "skills": skills, "response": response}
+                df = pd.concat([df, pd.DataFrame([new_row])], ignore_index=True)
                 df.to_csv(FILE_PATH, index=False)
-
-                st.session_state["saved"] = True
+                st.session_state["saved"]      = True
                 st.session_state["clear_form"] = True
-
                 st.rerun()
             else:
                 st.warning("Name, email and skills are required.")
 
-                # ✅ CLEAR FIELDS
-                st.session_state["clear_form"] = True
-
-
-                st.session_state["saved"] = True
-                st.rerun()
-
-
-
-
     st.stop()
 
-# ── Build in-memory structures from CSV ───────────────────────────────────────
+# ── Build in-memory structures ────────────────────────────────────────────────
 candidates = []
 responses  = {}
 
@@ -155,55 +120,43 @@ for _, row in df.iterrows():
     if row_email.lower() == "nan":
         row_email = ""
 
-    candidates.append({
-        "name":   row["name"],
-        "email":  row_email,
-        "skills": parsed_skills,
-    })
-
+    candidates.append({"name": row["name"], "email": row_email, "skills": parsed_skills})
     if row_email:
         responses[row_email] = str(row.get("response", "")).strip()
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 def _display_email(email: str) -> str:
-    if not email or email.lower() == "nan":
-        return "_Not provided_"
-    return email
+    return "_Not provided_" if not email or email.lower() == "nan" else email
 
 
-# BUG FIX #3 — removed dead st.sidebar.write() line that was placed after return
 def _call_model(prompt: str) -> str | None:
-    if not model:
-        if strict_ai:
-            st.error("🚫 Strict AI Mode: No API key or model available.")
-            st.stop()
+    """Call Groq LLM. Errors shown in sidebar."""
+    if strict_ai and not client:
+        st.error("❌ Strict AI Mode: No model available.")
+        st.stop()
+    if not client:
         return None
-
     try:
-        response = model.generate_content(prompt).text
-        
-        # 🔥 Show raw AI output (for demo/debug)
+        response = client.chat.completions.create(
+            model=model_name,
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=512,
+            temperature=0.2,
+        )
+        result = response.choices[0].message.content
         if show_debug:
-            st.sidebar.write("🧠 RAW AI RESPONSE:")
-            st.sidebar.write(response)
-
-        return response
-
+            st.sidebar.code(result, language="text")
+        return result
     except Exception as e:
-        if strict_ai:
-            st.error(f"❌ AI call failed: {e}")
-            st.stop()
-
-        st.sidebar.warning(f"⚠️ AI call failed → fallback used")
+        st.sidebar.error(f"❌ AI Error: {e}")
         return None
 
 
 def _skill_in_text(skill: str, text: str) -> bool:
     return bool(re.search(rf"\b{re.escape(skill)}\b", text, re.IGNORECASE))
 
-
-# ── Functions ─────────────────────────────────────────────────────────────────
+# ── Core functions ────────────────────────────────────────────────────────────
 
 def extract_skills(jd: str) -> list[str]:
     res = _call_model(
@@ -212,7 +165,6 @@ def extract_skills(jd: str) -> list[str]:
     )
     if res:
         return [s.strip().lower() for s in res.split(",") if s.strip()]
-
     keywords = [
         "python", "gis", "qgis", "sql", "excel", "machine learning",
         "remote sensing", "arcgis", "tableau", "postgis", "r language",
@@ -222,25 +174,21 @@ def extract_skills(jd: str) -> list[str]:
     return [k for k in keywords if _skill_in_text(k, jd)]
 
 
-def _fallback_interest_score(candidate_response: str) -> int:
-    text  = candidate_response.lower()
+def _fallback_interest_score(text: str) -> int:
     words = len(text.split())
     score = min(40 + words, 70)
-    positive_words = [
+    bonus = sum(4 for w in [
         "passionate", "experience", "excited", "love", "interested",
         "background", "worked", "built", "developed", "skilled",
         "years", "project", "team", "contribute", "learn",
-    ]
-    bonus = sum(4 for w in positive_words if w in text)
+    ] if w in text.lower())
     return min(score + bonus, 95)
 
 
-# BUG FIX #1 — removed accidental `prompt = f"""` line inside the f-string call
 def calculate_interest(candidate_response: str, jd: str) -> int:
     candidate_response = candidate_response.strip()
     if not candidate_response:
         return 15
-
     res = _call_model(f"""
 Evaluate candidate interest STRICTLY.
 
@@ -256,37 +204,28 @@ Scoring rules:
 30-59  → Weak alignment
 0-29   → No real interest
 
-Do NOT give middle scores unless justified.
+- Give DIFFERENT scores to different candidates
+- Use the full 0-100 range aggressively
+- Do NOT cluster scores near 50
 
-- Avoid giving same score to different candidates
-- Use full range aggressively
-
-Return ONLY a number (0-100). No words, no explanation.
+Return ONLY a single integer (0-100). No words, no explanation.
 """)
-
     if res:
-        match = re.search(r"\b(\d{1,3})\b", res.strip())
-        if match:
-            return max(0, min(100, int(match.group(1))))
-
+        m = re.search(r"\b(\d{1,3})\b", res.strip())
+        if m:
+            return max(0, min(100, int(m.group(1))))
     return _fallback_interest_score(candidate_response)
 
 
 def _fallback_skill_score(jd: str, skills_str: str) -> tuple[int, str]:
-    skill_tokens = [s.strip().lower() for s in skills_str.split(",") if s.strip()]
-    if not skill_tokens:
+    tokens = [s.strip().lower() for s in skills_str.split(",") if s.strip()]
+    if not tokens:
         return 10, "No skills listed."
-
-    hits  = [s for s in skill_tokens if _skill_in_text(s, jd)]
-    ratio = len(hits) / max(len(skill_tokens), 1)
-    score = int(10 + ratio * 70)
-
-    if hits:
-        return score, f"Keyword matches: {', '.join(hits)}"
-    return score, "No skill keywords matched the job description."
+    hits  = [s for s in tokens if _skill_in_text(s, jd)]
+    score = int(10 + (len(hits) / max(len(tokens), 1)) * 70)
+    return (score, f"Keyword matches: {', '.join(hits)}") if hits else (score, "No skill keywords matched.")
 
 
-# BUG FIX #2 — removed accidental `prompt = f"""` line inside the f-string call
 def calculate_skill_match_ai(jd: str, skills_str: str) -> tuple[int, str]:
     res = _call_model(f"""
 You are a STRICT technical recruiter.
@@ -297,54 +236,40 @@ Job Description:
 Candidate Skills:
 {skills_str}
 
-Score STRICTLY using this rubric:
-
-90-100 → Almost perfect match (has most required + relevant experience)
-70-89  → Good match but missing 1-2 important skills
+Score STRICTLY:
+90-100 → Almost perfect match
+70-89  → Good but missing 1-2 important skills
 40-69  → Partial match, lacks important skills
 0-39   → Poor or irrelevant
 
-IMPORTANT RULES:
-- Do NOT give similar scores to different candidates
-- Use full range aggressively
+Rules:
+- Give DIFFERENT scores to different candidates
+- Use the full range aggressively
 - Penalize missing core skills heavily
-- Use DIFFERENT scores for different candidates
-- Avoid clustering scores
-- Be decisive
 
-Return ONLY in this exact format:
+Respond ONLY in this exact format (two lines):
 Score: <number>
 Reason: <one short sentence>
 """)
-
     if res:
-        score_match = re.search(r"Score:\s*(\d+)", res)
-        score       = int(score_match.group(1)) if score_match else None
-        reason      = res.split("Reason:")[-1].strip() if "Reason:" in res else res.strip()
-        if score is not None:
-            return max(0, min(100, score)), reason
-
+        sm = re.search(r"Score:\s*(\d+)", res)
+        if sm:
+            score  = max(0, min(100, int(sm.group(1))))
+            reason = res.split("Reason:")[-1].strip() if "Reason:" in res else res.strip()
+            return score, reason
     return _fallback_skill_score(jd, skills_str)
 
 
-def generate_ai_explanation(
-    jd: str,
-    candidate_name: str,
-    match_score: float,
-    interest_score: float,
-) -> str:
+def generate_ai_explanation(jd: str, name: str, match: float, interest: float) -> str:
     res = _call_model(f"""
-Job Description:
-{jd}
+Job Description: {jd}
+Candidate: {name}
+Skill Match: {match}/100  |  Interest: {interest}/100
 
-Candidate: {candidate_name}
-Skill Match Score: {match_score}/100
-Interest Score: {interest_score}/100
-
-In 2-3 sentences explain:
-- Whether this candidate is a good fit and why
-- Their key strength
-- The biggest concern or gap (if any)
+In 2-3 sentences:
+- Is this candidate a good fit and why?
+- Key strength
+- Biggest gap or concern
 """)
     return res if res else "AI explanation unavailable."
 
@@ -352,62 +277,42 @@ In 2-3 sentences explain:
 def match_candidates(jd: str, candidates: list, responses: dict | None = None) -> list:
     jd_skills = extract_skills(jd)
     results   = []
-
     for candidate in candidates:
-        candidate_response = ""
-        if responses and candidate["email"]:
-            candidate_response = responses.get(candidate["email"], "")
+        resp    = (responses or {}).get(candidate["email"], "") if candidate["email"] else ""
+        i_score = calculate_interest(resp, jd)
 
-        interest_score = calculate_interest(candidate_response, jd)
+        skills_str         = ", ".join(candidate["skills"]) or "None listed"
+        m_score, ai_reason = calculate_skill_match_ai(jd, skills_str)
+        m_score            = round(m_score, 2)
+        final              = round(0.7 * m_score + 0.3 * i_score, 2)
 
-        skills_str  = ", ".join(candidate["skills"]) if candidate["skills"] else "None listed"
-        match_score, ai_reason = calculate_skill_match_ai(jd, skills_str)
-        match_score = round(match_score, 2)
+        matched = [s for s in candidate["skills"] if _skill_in_text(s, jd)]
+        missing = [s for s in jd_skills if s not in candidate["skills"]]
 
-        final_score    = round((0.7 * match_score) + (0.3 * interest_score), 2)
-        matched_skills = [s for s in candidate["skills"] if _skill_in_text(s, jd)]
-        missing_skills = [s for s in jd_skills if s not in candidate["skills"]]
-
-        if match_score >= 80:
-            explanation = "Strong match: Most key skills align well."
-        elif match_score >= 50:
-            explanation = "Moderate match: Some relevant skills, but gaps exist."
-        else:
-            explanation = "Weak match: Limited relevant skills for this role."
-
-        if final_score >= 70:
-            decision = "Shortlist"
-        elif final_score >= 40:
-            decision = "Consider"
-        else:
-            decision = "Reject"
+        explanation = (
+            "Strong match: Most key skills align well."         if m_score >= 80 else
+            "Moderate match: Some relevant skills, gaps exist." if m_score >= 50 else
+            "Weak match: Limited relevant skills for this role."
+        )
+        decision = "Shortlist" if final >= 70 else "Consider" if final >= 40 else "Reject"
 
         results.append({
-            "name":           candidate["name"],
-            "email":          candidate["email"],
-            "match_score":    match_score,
-            "interest_score": interest_score,
-            "final_score":    final_score,
-            "matched_skills": matched_skills,
-            "missing_skills": missing_skills,
-            "decision":       decision,
-            "explanation":    explanation,
-            "skill_reason":   ai_reason,
+            "name": candidate["name"], "email": candidate["email"],
+            "match_score": m_score, "interest_score": i_score, "final_score": final,
+            "matched_skills": matched, "missing_skills": missing,
+            "decision": decision, "explanation": explanation, "skill_reason": ai_reason,
         })
-
-        
-
     return sorted(results, key=lambda x: x["final_score"], reverse=True)
-
 
 # ── Recruiter View ────────────────────────────────────────────────────────────
 if mode == "Recruiter View":
     st.title("🤖 AI Talent Scouting Agent")
     st.caption("🧠 Powered by LLM-based semantic evaluation, not keyword matching")
+
     if strict_ai:
         st.warning("🚫 Strict AI Mode Enabled — No fallback allowed")
-    elif model:
-        st.success("🧠 AI Mode Active")
+    elif client:
+        st.success(f"🧠 AI Mode Active ({model_name})")
     else:
         st.info("⚙️ Fallback Mode Active")
 
@@ -415,12 +320,8 @@ if mode == "Recruiter View":
     with st.expander("View Candidates", expanded=False):
         df_display  = df.copy()
         sort_option = st.selectbox("Sort Candidates By", ["Name (A-Z)", "Latest Added"])
-
-        if sort_option == "Name (A-Z)":
-            df_display = df_display.sort_values(by="name")
-        else:
-            df_display = df_display.iloc[::-1]
-
+        df_display  = (df_display.sort_values("name")
+                       if sort_option == "Name (A-Z)" else df_display.iloc[::-1])
         skill_filter = st.text_input("Filter by Skill")
         if skill_filter:
             df_display = df_display[
@@ -439,11 +340,10 @@ if mode == "Recruiter View":
         st.warning("No candidates yet. Switch to Candidate View to add profiles.")
         st.stop()
 
-
-    if strict_ai:
-        st.warning("🚫 Strict AI Mode Enabled — No fallback allowed")
-
     if st.button("Run Analysis"):
+        if strict_ai and not client:
+            st.error("❌ Cannot run: AI model not available in Strict Mode.")
+            st.stop()
         if not jd_input.strip():
             st.warning("Please enter a job description.")
             st.stop()
@@ -452,16 +352,12 @@ if mode == "Recruiter View":
             results = match_candidates(jd_input, candidates, responses)
 
         st.success(f"✅ Analysis complete! {len(results)} candidates evaluated.")
-        if model:
-            st.caption("🧠 Scores generated using AI")
-        else:
-            st.caption("⚙️ Scores generated using fallback logic")
+        st.caption("🧠 Scores via AI" if client else "⚙️ Scores via fallback logic")
         st.balloons()
         st.divider()
 
-        top = results[:3]
         st.subheader("🏆 Top Candidates")
-        for t in top:
+        for t in results[:3]:
             st.markdown(
                 f"**👤 {t['name']}**  \n"
                 f"📧 {_display_email(t['email'])}  \n"
@@ -469,25 +365,23 @@ if mode == "Recruiter View":
             )
             st.divider()
 
-        top_text = "\n".join([
-            f"{t['name']} ({_display_email(t['email'])}): "
-            f"score {t['final_score']}, skills {t['matched_skills']}"
-            for t in top
-        ])
-
-        if model:
-            res = _call_model(f"""
+        if client:
+            top_text = "\n".join([
+                f"{t['name']}: score {t['final_score']}, skills {t['matched_skills']}"
+                for t in results[:3]
+            ])
+            summary = _call_model(f"""
 Job Description: {jd_input}
 
 Top Candidates:
 {top_text}
 
-In a short paragraph explain why these are the top candidates,
-their key strengths, and any hiring risks to watch out for.
+In a short paragraph: why are these the top candidates, their key strengths,
+and any hiring risks?
 """)
-            if res:
+            if summary:
                 st.subheader("🧠 AI Recruiter Summary")
-                st.markdown(res)
+                st.markdown(summary)
         else:
             st.info("AI summary unavailable (fallback mode active).")
 
@@ -497,10 +391,10 @@ their key strengths, and any hiring risks to watch out for.
             with st.container():
                 st.markdown(f"### 👤 {r['name']}  📧 {_display_email(r['email'])}")
 
-                col1, col2, col3 = st.columns(3)
-                col1.metric("Final Score",    r["final_score"])
-                col2.metric("Match Score",    r["match_score"])
-                col3.metric("Interest Score", r["interest_score"])
+                c1, c2, c3 = st.columns(3)
+                c1.metric("Final Score",    r["final_score"])
+                c2.metric("Match Score",    r["match_score"])
+                c3.metric("Interest Score", r["interest_score"])
 
                 st.write("🔎 Matched Skills:", ", ".join(r["matched_skills"]) or "None")
                 st.write("🧠 AI Skill Evaluation:", r.get("skill_reason", "N/A"))
@@ -516,17 +410,11 @@ their key strengths, and any hiring risks to watch out for.
                     st.markdown("🚫 **Missing skills:**")
                     st.write(", ".join(r["missing_skills"]))
 
-                ai_explanation = (
+                explanation = (
                     generate_ai_explanation(
-                        jd_input,
-                        r["name"],
-                        r["match_score"],
-                        r["interest_score"],
-                    )
-                    if i < 3
-                    else r["explanation"]
+                        jd_input, r["name"], r["match_score"], r["interest_score"]
+                    ) if i < 3 else r["explanation"]
                 )
-
-                st.markdown(f"🧠 **AI Insight:** {ai_explanation}")
+                st.markdown(f"🧠 **AI Insight:** {explanation}")
                 st.caption(r["explanation"])
                 st.divider()
