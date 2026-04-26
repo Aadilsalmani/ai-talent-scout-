@@ -30,7 +30,7 @@ if not api_key:
 
 CANDIDATE_MODELS = [
     "gemini-1.5-pro-latest",
-    "gemini-pro",
+    "gemini-pro"
 ]
 
 model       = None
