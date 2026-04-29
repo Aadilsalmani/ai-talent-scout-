@@ -1,6 +1,5 @@
 import os
 import re
-import io
 
 import pandas as pd
 import streamlit as st
@@ -63,14 +62,14 @@ elif model_error:
 else:
     st.sidebar.warning("⚠️ No API key — using fallback scoring")
 
-# ── Data ──────────────────────────────────────────────────────────────────────
+# ── Persistent candidate database (shared, read-only for recruiters) ──────────
 FILE_PATH = "candidates.csv"
 REQUIRED_COLS = {"name", "email", "skills", "response"}
 
 if os.path.exists(FILE_PATH):
-    df = pd.read_csv(FILE_PATH)
+    df_persistent = pd.read_csv(FILE_PATH)
 else:
-    df = pd.DataFrame(columns=["name", "email", "skills", "response"])
+    df_persistent = pd.DataFrame(columns=["name", "email", "skills", "response"])
 
 # ── Candidate View ────────────────────────────────────────────────────────────
 if mode == "Candidate View":
@@ -97,8 +96,10 @@ if mode == "Candidate View":
             if name and skills and email:
                 new_row = {"name": name, "email": email,
                            "skills": skills, "response": response}
-                df = pd.concat([df, pd.DataFrame([new_row])], ignore_index=True)
-                df.to_csv(FILE_PATH, index=False)
+                df_persistent = pd.concat(
+                    [df_persistent, pd.DataFrame([new_row])], ignore_index=True
+                )
+                df_persistent.to_csv(FILE_PATH, index=False)
                 st.session_state["saved"]      = True
                 st.session_state["clear_form"] = True
                 st.rerun()
@@ -107,11 +108,10 @@ if mode == "Candidate View":
 
     st.stop()
 
-# ── Build in-memory structures ────────────────────────────────────────────────
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
 def build_candidates(dataframe):
-    """Parse a dataframe into candidates list and responses dict."""
-    cands = []
-    resps = {}
+    cands, resps = [], {}
     for _, row in dataframe.iterrows():
         skills_raw    = str(row["skills"]) if pd.notna(row.get("skills")) else ""
         parsed_skills = [s.strip().lower() for s in skills_raw.split(",") if s.strip()]
@@ -123,9 +123,6 @@ def build_candidates(dataframe):
             resps[row_email] = str(row.get("response", "")).strip()
     return cands, resps
 
-candidates, responses = build_candidates(df)
-
-# ── Helpers ───────────────────────────────────────────────────────────────────
 
 def _display_email(email: str) -> str:
     return "_Not provided_" if not email or email.lower() == "nan" else email
@@ -138,13 +135,13 @@ def _call_model(prompt: str) -> str | None:
     if not client:
         return None
     try:
-        response = client.chat.completions.create(
+        resp = client.chat.completions.create(
             model=model_name,
             messages=[{"role": "user", "content": prompt}],
             max_tokens=512,
             temperature=0.2,
         )
-        result = response.choices[0].message.content
+        result = resp.choices[0].message.content
         if show_debug:
             st.sidebar.code(result, language="text")
         return result
@@ -316,88 +313,86 @@ if mode == "Recruiter View":
     else:
         st.info("⚙️ Fallback Mode Active")
 
-    # ── CSV Upload ────────────────────────────────────────────────────────────
     st.subheader("📂 Candidate Database")
 
-    with st.expander("⬆️ Upload your own candidates CSV", expanded=False):
+    # ── Session-only CSV upload ───────────────────────────────────────────────
+    with st.expander("⬆️ Upload your own candidates CSV (session only)", expanded=False):
+        st.info(
+            "📌 Your uploaded file is **only used for this session** — "
+            "it is never saved to the shared database."
+        )
         st.markdown(
-            "Upload a CSV with these columns: "
+            "CSV must have these columns: "
             "`name`, `email`, `skills` (comma-separated), `response`"
         )
 
-        # Download template button
+        # Template download
         template_df  = pd.DataFrame([{
             "name":     "Jane Doe",
             "email":    "jane@example.com",
             "skills":   "python, sql, machine learning",
             "response": "I am passionate about data science and have 3 years of experience..."
         }])
-        template_csv = template_df.to_csv(index=False).encode("utf-8")
         st.download_button(
             label="📥 Download template CSV",
-            data=template_csv,
+            data=template_df.to_csv(index=False).encode("utf-8"),
             file_name="candidates_template.csv",
             mime="text/csv",
         )
 
-        uploaded_file = st.file_uploader(
-            "Choose CSV file",
-            type=["csv"],
-            key="csv_uploader",
-        )
+        uploaded_file = st.file_uploader("Choose CSV file", type=["csv"], key="csv_uploader")
 
         if uploaded_file is not None:
             try:
                 uploaded_df = pd.read_csv(uploaded_file)
-                # Validate required columns
-                missing_cols = REQUIRED_COLS - set(uploaded_df.columns.str.lower())
+                uploaded_df.columns = uploaded_df.columns.str.lower()
+                missing_cols = REQUIRED_COLS - set(uploaded_df.columns)
+
                 if missing_cols:
                     st.error(
                         f"❌ Missing columns: **{', '.join(missing_cols)}**\n\n"
-                        "Your CSV must have: `name`, `email`, `skills`, `response`"
+                        "Required: `name`, `email`, `skills`, `response`"
                     )
                 else:
-                    # Normalise column names to lowercase
-                    uploaded_df.columns = uploaded_df.columns.str.lower()
-
-                    col1, col2 = st.columns(2)
-                    col1.metric("Rows found", len(uploaded_df))
-                    col2.metric(
+                    c1, c2 = st.columns(2)
+                    c1.metric("Rows found", len(uploaded_df))
+                    c2.metric(
                         "Valid emails",
                         uploaded_df["email"].dropna()
                         .apply(lambda x: "@" in str(x)).sum()
                     )
-
                     st.dataframe(uploaded_df.head(5), use_container_width=True)
 
-                    action = st.radio(
-                        "What would you like to do?",
-                        ["Replace existing candidates", "Merge with existing candidates"],
-                        horizontal=True,
+                    # Store in session state — never touches disk
+                    st.session_state["session_df"] = uploaded_df
+                    st.success(
+                        f"✅ {len(uploaded_df)} candidates loaded for this session. "
+                        "This data will not affect the shared database."
                     )
-
-                    if st.button("✅ Confirm & Load", type="primary"):
-                        if action == "Replace existing candidates":
-                            df = uploaded_df.copy()
-                        else:
-                            df = pd.concat([df, uploaded_df], ignore_index=True).drop_duplicates(
-                                subset=["email"]
-                            )
-                        df.to_csv(FILE_PATH, index=False)
-                        # Rebuild in-memory structures
-                        candidates, responses = build_candidates(df)
-                        st.success(
-                            f"✅ Loaded {len(df)} candidates "
-                            f"({'replaced' if action.startswith('Replace') else 'merged'})."
-                        )
-                        st.rerun()
 
             except Exception as e:
                 st.error(f"❌ Could not read file: {e}")
 
-    # ── View / filter existing candidates ────────────────────────────────────
+        # Clear session upload button
+        if st.session_state.get("session_df") is not None:
+            if st.button("🗑️ Clear uploaded data", type="secondary"):
+                del st.session_state["session_df"]
+                st.rerun()
+
+    # ── Decide which dataset to use ───────────────────────────────────────────
+    # Session upload takes priority; falls back to shared persistent database
+    session_df = st.session_state.get("session_df")
+
+    if session_df is not None:
+        active_df = session_df
+        st.caption("🔒 Using your uploaded CSV for this session")
+    else:
+        active_df = df_persistent
+        st.caption("🌐 Using shared candidate database")
+
+    # ── View candidates ───────────────────────────────────────────────────────
     with st.expander("👁️ View Candidates", expanded=False):
-        df_display  = df.copy()
+        df_display  = active_df.copy()
         sort_option = st.selectbox("Sort by", ["Name (A-Z)", "Latest Added"])
         df_display  = (df_display.sort_values("name")
                        if sort_option == "Name (A-Z)" else df_display.iloc[::-1])
@@ -408,14 +403,8 @@ if mode == "Recruiter View":
             ]
         st.dataframe(df_display, use_container_width=True)
 
-        # Export current database
-        if not df.empty:
-            st.download_button(
-                label="📤 Export current candidates CSV",
-                data=df.to_csv(index=False).encode("utf-8"),
-                file_name="candidates_export.csv",
-                mime="text/csv",
-            )
+    # ── Build candidates from active dataset ──────────────────────────────────
+    candidates, responses = build_candidates(active_df)
 
     jd_input = st.text_area(
         "Enter Job Description",
@@ -424,7 +413,7 @@ if mode == "Recruiter View":
         "and remote sensing. Experience with ArcGIS or PostGIS is a plus.",
     )
 
-    if df.empty:
+    if active_df.empty:
         st.warning("No candidates yet. Upload a CSV above or switch to Candidate View.")
         st.stop()
 
